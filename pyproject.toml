@@ -312,5 +312,6 @@ line-ending = "auto"
 [tool.pytest.ini_options]
 markers = [
     "benchmark: marks tests as benchmark tests (deselect with '-m \"not benchmark\"')",
+    "cuda: marks tests that require CUDA",
     "qwen3_5_ulysses: Qwen3.5 GatedDeltaNet Ulysses SP tests (run when ulysses or qwen3_5 code is touched)",
 ]

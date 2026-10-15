@@ -92,6 +92,45 @@ def test_trainer_forwards_dedication_and_ns_options_only_for_dmuon(monkeypatch, 
         assert "optimizer_config" not in calls
 
 
+@pytest.mark.parametrize("broadcast", [None, False, True])
+def test_dmuon_rejects_rank0_broadcast_before_model_setup(monkeypatch, broadcast):
+    from veomni.distributed import torch_parallelize
+
+    optimizer_config = object()
+    monkeypatch.setattr(
+        torch_parallelize,
+        "get_parallel_state",
+        lambda: SimpleNamespace(
+            dp_mode="fsdp2", fsdp_enabled=True, tp_enabled=False, sp_enabled=False, any_extra_parallel_enabled=False
+        ),
+    )
+    model = nn.Linear(4, 4, dtype=torch.bfloat16)
+    options = {
+        "weights_path": "checkpoint",
+        "mixed_precision": SimpleNamespace(enable=True),
+        "enable_gradient_checkpointing": False,
+        "optimizer_config": optimizer_config,
+    }
+    if broadcast is not None:
+        options["broadcast_model_weights_from_rank0"] = broadcast
+    if broadcast:
+        with pytest.raises(ValueError, match="DMuon integration does not support broadcast_model_weights_from_rank0"):
+            torch_parallelize.build_parallelize_model(model, **options)
+        assert model.weight.dtype is torch.bfloat16
+    else:
+        calls = {}
+
+        def parallelize_model_fsdp2(**kwargs):
+            calls.update(kwargs)
+            return kwargs["model"]
+
+        monkeypatch.setattr(torch_parallelize, "parallelize_model_fsdp2", parallelize_model_fsdp2)
+        assert torch_parallelize.build_parallelize_model(model, **options) is model
+        assert model.weight.dtype is torch.float32
+        assert calls["optimizer_config"] is optimizer_config
+        assert not calls.get("broadcast_model_weights_from_rank0", False)
+
+
 @pytest.mark.parametrize("kind", ["adamw", "muon", "dmuon"])
 @pytest.mark.parametrize("micro_steps", [1, 3])
 def test_trainer_uses_scoped_official_no_sync(monkeypatch, kind, micro_steps):
@@ -265,6 +304,7 @@ def test_foreign_trainable_parameter_has_clear_error(construction):
         build(param_groups=[{"params": [nn.Parameter(torch.randn(4, 4))]}])
 
 
+@pytest.mark.cuda
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Official DMuon requires CUDA")
 @pytest.mark.parametrize(
     "style, checkpoints",

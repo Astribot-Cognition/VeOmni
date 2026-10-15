@@ -417,6 +417,10 @@ without tensor, sequence or expert parallelism, CPU offload or LoRA. Its DCP
 checkpoints use synchronous saving and a DMuon-specific optimizer sidecar; do
 not resume optimizer state across DMuon and another optimizer type. Loading
 model weights without optimizer state is supported when changing optimizer.
+The VeOmni DMuon integration does not currently support
+`train.broadcast_model_weights_from_rank0: true` while loading model weights.
+That combination raises an error before checkpoint I/O; set it to `false` for
+DMuon runs.
 
 The backend can be selected with `train.optimizer.dmuon_ns_backend` (`direct`
 or `gram`) and `train.optimizer.dmuon_ns_coefficients` (`classic` or

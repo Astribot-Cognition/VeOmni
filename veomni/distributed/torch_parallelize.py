@@ -446,6 +446,17 @@ def build_parallelize_model(
 
     parallel_state = get_parallel_state()
 
+    if (
+        kwargs.get("optimizer_config") is not None
+        and weights_path is not None
+        and kwargs.get("broadcast_model_weights_from_rank0", False)
+    ):
+        raise ValueError(
+            "The VeOmni DMuon integration does not support broadcast_model_weights_from_rank0 when loading model weights; "
+            "set train.broadcast_model_weights_from_rank0=false. DMuon must load full CPU weights "
+            "before parameter ownership is assigned."
+        )
+
     if kwargs.get("optimizer_config") is not None and (
         parallel_state.dp_mode != "fsdp2"
         or parallel_state.tp_enabled
