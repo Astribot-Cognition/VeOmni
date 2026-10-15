@@ -15,6 +15,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
@@ -271,14 +272,22 @@ def build_optimizer(
     no_decay_params: Optional[List[str]] = None,
     muon_kwargs: Optional[Dict[str, Any]] = None,
 ) -> "torch.optim.Optimizer":
+    if optimizer_type == "dmuon":
+        from .dmuon import build_dmuon
+
+        return build_dmuon(
+            model,
+            lr,
+            betas,
+            eps,
+            weight_decay,
+            param_groups,
+            no_decay_modules,
+            no_decay_params,
+            muon_kwargs,
+        )
+
     if optimizer_type == "muon":
-        if param_groups is not None:
-            logger.warning_rank0(
-                "build_optimizer(optimizer_type='muon') ignores the provided "
-                "param_groups argument; all parameters are re-split by "
-                "split_muon_adamw_params. To control vit vs. backbone learning "
-                "rates with Muon, file a follow-up or use AdamW for now."
-            )
         return _build_muon_with_adamw(
             model,
             lr=lr,
@@ -286,6 +295,7 @@ def build_optimizer(
             eps=eps,
             weight_decay=weight_decay,
             fused=fused,
+            param_groups=param_groups,
             no_decay_modules=no_decay_modules,
             no_decay_params=no_decay_params,
             muon_kwargs=muon_kwargs,
@@ -347,12 +357,15 @@ def _build_muon_with_adamw(
     eps: float,
     weight_decay: float,
     fused: bool,
+    param_groups: Optional[Sequence[Dict[str, Any]]],
     no_decay_modules: Optional[List[str]],
     no_decay_params: Optional[List[str]],
     muon_kwargs: Optional[Dict[str, Any]],
 ) -> "MultiOptimizer":
-    """Build a Muon (2D/3D hidden weights) + AdamW (everything else) MultiOptimizer.
+    """Build Muon for eligible hidden/expert weights and AdamW for the rest.
 
+    Convolution modules use the AdamW fallback. Semantic learning-rate groups
+    keep their ratio to the base LR on Muon and their actual LR on AdamW.
     ExtraParallel params are split into separate sub-optimizers so DCP state
     dict keys and grad-clipping metadata stay keyed by mesh.
     """
@@ -367,6 +380,30 @@ def _build_muon_with_adamw(
             "Muon optimizer was selected but the model has no eligible 2D/3D parameters. "
             "Falling back to AdamW would be silent so we raise instead."
         )
+
+    semantic_groups = None
+    decay_param_names = set(get_parameter_names(model, no_decay_modules, no_decay_params))
+    decay_ids = {id(p) for name, p in model.named_parameters() if name in decay_param_names}
+    if param_groups is not None:
+        if not math.isfinite(lr) or lr <= 0:
+            raise ValueError("Muon semantic parameter groups require a positive finite base learning rate")
+        trainable_ids = {id(p) for p in muon_params + adamw_params}
+        assigned_ids = set()
+        semantic_groups = []
+        for group in param_groups:
+            parameters = [p for p in group["params"] if p.requires_grad]
+            for p in parameters:
+                if id(p) not in trainable_ids:
+                    raise ValueError("Muon parameter groups contain a parameter outside the model")
+                if id(p) in assigned_ids:
+                    raise ValueError("Muon parameter groups contain duplicate parameters")
+                assigned_ids.add(id(p))
+            group_lr = group.get("lr", lr)
+            if not math.isfinite(group_lr) or group_lr < 0:
+                raise ValueError("Muon parameter-group learning rates must be finite and nonnegative")
+            semantic_groups.append({**group, "params": parameters, "lr": group_lr})
+        if assigned_ids != trainable_ids:
+            raise ValueError("Muon parameter groups must cover every trainable model parameter")
 
     extra_parallel_aware = _should_build_extra_parallel_aware(model)
     parallel_state = get_parallel_state() if extra_parallel_aware else None
@@ -402,9 +439,40 @@ def _build_muon_with_adamw(
                 f"muon_non_extra_parallel={len(muon_non_para)}, adamw_non_extra_parallel={len(adamw_non_para)}"
             )
 
+    def _semantic_subset(params: List[torch.nn.Parameter], muon: bool) -> List[Dict[str, Any]]:
+        subset_ids = {id(p) for p in params}
+        groups = []
+        for group in semantic_groups:
+            subset = [p for p in group["params"] if id(p) in subset_ids]
+            if muon:
+                if subset:
+                    # A zero-decay semantic group remains zero-decay on both
+                    # optimizers; otherwise Muon uses its dedicated decay.
+                    groups.append(
+                        {
+                            "params": subset,
+                            "lr": muon_kwargs.get("lr", 2e-2) * group["lr"] / lr,
+                            "weight_decay": 0.0
+                            if group.get("weight_decay") == 0
+                            else muon_kwargs.get("weight_decay", 0.0),
+                        }
+                    )
+            else:
+                for decay in (True, False):
+                    selected = [p for p in subset if (id(p) in decay_ids) == decay]
+                    if selected:
+                        groups.append(
+                            {
+                                **group,
+                                "params": selected,
+                                "weight_decay": group.get("weight_decay", weight_decay) if decay else 0.0,
+                            }
+                        )
+        return groups
+
     def _make_muon(params: List[torch.nn.Parameter]) -> DistributedMuon:
         return DistributedMuon(
-            params,
+            _semantic_subset(params, muon=True) if semantic_groups is not None else params,
             lr=muon_kwargs.get("lr", 2e-2),
             weight_decay=muon_kwargs.get("weight_decay", 0.0),
             momentum=muon_kwargs.get("momentum", 0.95),
@@ -416,7 +484,11 @@ def _build_muon_with_adamw(
         )
 
     def _make_adamw(params: List[torch.nn.Parameter]) -> AdamW:
-        groups = _make_param_groups_for_subset(model, params, weight_decay, no_decay_modules, no_decay_params)
+        groups = (
+            _semantic_subset(params, muon=False)
+            if semantic_groups is not None
+            else _make_param_groups_for_subset(model, params, weight_decay, no_decay_modules, no_decay_params)
+        )
         foreach = not fused
         return AdamW(groups, lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, fused=fused, foreach=foreach)
 

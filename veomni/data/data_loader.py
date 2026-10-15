@@ -46,6 +46,17 @@ class DistributedDataloader(StatefulDataLoader):
     dataset: "Dataset"
     sampler: "StatefulDistributedSampler"
 
+    def _get_iterator(self):
+        """Preserve the global CPU training RNG when rebuilding a saved iterator.
+
+        The native factory uses the default generator. New-epoch seed draws
+        remain outside this guard, including persistent worker resets.
+        """
+        if self.next_iter_state is None:
+            return super()._get_iterator()
+        with torch.random.fork_rng(devices=[]):
+            return super()._get_iterator()
+
     def set_epoch(self, epoch: int) -> None:
         if self.sampler is not None and hasattr(self.sampler, "set_epoch"):
             self.sampler.set_epoch(epoch)

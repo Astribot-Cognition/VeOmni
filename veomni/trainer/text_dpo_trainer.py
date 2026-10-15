@@ -346,7 +346,8 @@ class TextDPOTrainer:
         num_micro_steps = len(micro_batches)
         for micro_step, micro_batch in enumerate(micro_batches):
             self.base.model_reshard(micro_step, num_micro_steps)
-            loss, loss_dict = self.forward_backward_step(micro_batch)
+            with self.base.gradient_sync_context(micro_step, num_micro_steps):
+                loss, loss_dict = self.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
             for k, v in loss_dict.items():

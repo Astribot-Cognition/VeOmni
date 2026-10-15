@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 import torch.nn as nn
@@ -216,6 +218,137 @@ class TestBuildOptimizer:
             build_optimizer(model, optimizer_type="muon", muon_kwargs={"lr": 1e-3})
 
 
+class TestSemanticGroups:
+    @staticmethod
+    def build(model, groups, **kwargs):
+        from veomni.optim import build_optimizer
+
+        return build_optimizer(
+            model,
+            lr=1e-3,
+            weight_decay=0.1,
+            optimizer_type="muon",
+            param_groups=groups,
+            muon_kwargs={"lr": 5e-3, "weight_decay": 0.2},
+            **kwargs,
+        )
+
+    def test_learning_rates_and_decay_match_independent_optimizers(self):
+        from veomni.optim import build_lr_scheduler
+
+        model = nn.ModuleDict({"visual": nn.Linear(4, 4), "backbone": nn.Linear(4, 4)})
+        reference = nn.ModuleDict({"visual": nn.Linear(4, 4), "backbone": nn.Linear(4, 4)})
+        reference.load_state_dict(model.state_dict())
+        groups = [
+            {"params": list(model["visual"].parameters()), "lr": 2e-4, "weight_decay": 0.0},
+            {"params": list(model["backbone"].parameters())},
+        ]
+        optimizer = self.build(model, groups, no_decay_params=["bias"])
+        muon = optimizer.optimizers_dict["muon"]
+        adamw = optimizer.optimizers_dict["adamw"]
+        assert [g["lr"] for g in muon.param_groups] == pytest.approx([1e-3, 5e-3])
+        assert [g["lr"] for g in adamw.param_groups] == pytest.approx([2e-4, 1e-3])
+        assert [g["weight_decay"] for g in muon.param_groups] == [0.0, 0.2]
+        assert [g["weight_decay"] for g in adamw.param_groups] == [0.0, 0.0]
+        assert "lr" not in groups[1]  # Caller-owned group dictionaries stay unchanged.
+
+        references = [
+            UpstreamMuon([reference["visual"].weight], lr=1e-3, weight_decay=0.0, adjust_lr_fn="match_rms_adamw"),
+            UpstreamMuon([reference["backbone"].weight], lr=5e-3, weight_decay=0.2, adjust_lr_fn="match_rms_adamw"),
+            torch.optim.AdamW([reference["visual"].bias], lr=2e-4, weight_decay=0.0, betas=(0.9, 0.95)),
+            torch.optim.AdamW([reference["backbone"].bias], lr=1e-3, weight_decay=0.0, betas=(0.9, 0.95)),
+        ]
+        for _ in range(3):
+            for actual, expected in zip(model.parameters(), reference.parameters()):
+                grad = torch.randn_like(actual)
+                actual.grad, expected.grad = grad.clone(), grad.clone()
+            optimizer.step()
+            for child in references:
+                child.step()
+            for actual, expected in zip(model.parameters(), reference.parameters()):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+        scheduler = build_lr_scheduler(optimizer, train_steps=10, lr=1e-3, lr_decay_style="cosine")
+        optimizer.step()
+        scheduler.step()
+        assert muon.param_groups[0]["lr"] / muon.param_groups[1]["lr"] == pytest.approx(0.2)
+        assert adamw.param_groups[0]["lr"] / adamw.param_groups[1]["lr"] == pytest.approx(0.2)
+
+    def test_fallback_respects_no_decay_modules_and_generator_groups(self):
+        model = nn.ModuleDict({"hidden": nn.Linear(4, 4), "norm": nn.LayerNorm(4), "lookup": nn.Embedding(4, 4)})
+        model["hidden"].bias.requires_grad_(False)
+        optimizer = self.build(
+            model,
+            [
+                {"params": model["hidden"].parameters(), "lr": 0.0},
+                {"params": model["norm"].parameters(), "lr": 2e-4, "weight_decay": 0.3},
+                {"params": model["lookup"].parameters(), "lr": 4e-4, "weight_decay": 0.3},
+            ],
+            no_decay_modules=["LayerNorm"],
+        )
+        assert optimizer.optimizers_dict["muon"].param_groups[0]["lr"] == 0.0
+        fallback = optimizer.optimizers_dict["adamw"].param_groups
+        assert [(g["lr"], g["weight_decay"]) for g in fallback] == [(2e-4, 0.0), (4e-4, 0.3)]
+        assigned = [
+            p for child in optimizer.optimizers_dict.values() for group in child.param_groups for p in group["params"]
+        ]
+        assert {id(p) for p in assigned} == {id(p) for p in model.parameters() if p.requires_grad}
+        assert len(assigned) == len({id(p) for p in assigned})
+
+    def test_flattened_optimizer_state_restore_keeps_semantic_groups(self):
+        model = nn.ModuleDict({"visual": nn.Linear(4, 4), "hidden": nn.Linear(4, 4)})
+
+        def build(target):
+            return self.build(
+                target,
+                [
+                    {"params": target["visual"].parameters(), "lr": 2e-4, "weight_decay": 0.0},
+                    {"params": target["hidden"].parameters()},
+                ],
+            )
+
+        optimizer = build(model)
+        for parameter in model.parameters():
+            parameter.grad = torch.randn_like(parameter)
+        optimizer.step()
+        restored_model = copy.deepcopy(model)
+        restored = build(restored_model)
+        restored.load_state_dict(copy.deepcopy(optimizer.state_dict()))
+        for name in optimizer.optimizers_dict:
+            actual = restored.optimizers_dict[name]
+            expected = optimizer.optimizers_dict[name]
+            assert [g["lr"] for g in actual.param_groups] == [g["lr"] for g in expected.param_groups]
+            assert [g["weight_decay"] for g in actual.param_groups] == [
+                g["weight_decay"] for g in expected.param_groups
+            ]
+        for parameter, resumed_parameter in zip(model.parameters(), restored_model.parameters()):
+            grad = torch.randn_like(parameter)
+            parameter.grad, resumed_parameter.grad = grad.clone(), grad.clone()
+        optimizer.step()
+        restored.step()
+        for parameter, resumed_parameter in zip(model.parameters(), restored_model.parameters()):
+            torch.testing.assert_close(parameter, resumed_parameter, rtol=0, atol=0)
+
+    @pytest.mark.parametrize("invalid", ["duplicate", "missing", "foreign", "negative_lr", "nan_lr"])
+    def test_invalid_groups_rejected(self, invalid):
+        model = nn.Linear(4, 4)
+        groups = [{"params": list(model.parameters())}]
+        expected = "duplicate"
+        if invalid == "duplicate":
+            groups.append({"params": [model.weight]})
+        elif invalid == "missing":
+            groups[0]["params"] = [model.weight]
+            expected = "every trainable"
+        elif invalid == "foreign":
+            groups[0]["params"].append(nn.Parameter(torch.ones(4, 4)))
+            expected = "outside the model"
+        else:
+            groups[0]["lr"] = -1.0 if invalid == "negative_lr" else float("nan")
+            expected = "finite and nonnegative"
+        with pytest.raises(ValueError, match=expected):
+            self.build(model, groups)
+
+
 class TestBatchedNS:
     """Math primitive parity + contract checks."""
 
@@ -277,3 +410,72 @@ class TestBatchedNS:
         out = batched_newton_schulz(torch.zeros(*shape))
         assert torch.isfinite(out).all()
         assert out.shape == tuple(shape)
+
+
+def assert_partition(model, muon, adamw, muon_names, adamw_names):
+    canonical = dict(model.named_parameters())
+    assigned = [id(p) for p in muon + adamw]
+    assert len(assigned) == len(set(assigned))
+    assert set(assigned) == {id(p) for p in model.parameters() if p.requires_grad}
+    assert len(muon) == len(muon_names) and len(adamw) == len(adamw_names)
+    assert all(canonical[name] is parameter for name, parameter in zip(muon_names, muon))
+    assert all(canonical[name] is parameter for name, parameter in zip(adamw_names, adamw))
+
+
+@pytest.mark.parametrize("conv_type", [nn.Conv1d, nn.ConvTranspose1d])
+def test_convolution_falls_back_without_losing_3d_experts(conv_type):
+    model = nn.ModuleDict(
+        {
+            "temporal_mixer": conv_type(8, 8, 4, groups=8),
+            "projection": nn.Linear(8, 8),
+            "experts": nn.ParameterList([nn.Parameter(torch.randn(4, 8, 16))]),
+        }
+    )
+    muon, adamw, muon_names, adamw_names = split_muon_adamw_params(model)
+    assert set(muon_names) == {"projection.weight", "experts.0"}
+    assert set(adamw_names) == {"temporal_mixer.weight", "temporal_mixer.bias", "projection.bias"}
+    assert_partition(model, muon, adamw, muon_names, adamw_names)
+
+
+@pytest.mark.parametrize("conv_type", [nn.Conv1d, nn.ConvTranspose1d])
+@pytest.mark.parametrize("alias_position", ["before", "after", "root"])
+@pytest.mark.parametrize("frozen", [False, True])
+def test_tied_convolution_uses_parameter_identity(conv_type, alias_position, frozen):
+    conv = conv_type(8, 8, 4, groups=8)
+    conv.weight.requires_grad_(not frozen)
+    alias = nn.Module()
+    alias.register_parameter("shared", conv.weight)
+    model = nn.Module()
+    if alias_position == "root":
+        model.register_parameter("shared", conv.weight)
+        model.add_module("temporal_mixer", conv)
+    else:
+        children = [("alias", alias), ("temporal_mixer", conv)]
+        if alias_position == "after":
+            children.reverse()
+        for name, child in children:
+            model.add_module(name, child)
+    model.add_module("projection", nn.Linear(8, 8))
+    model.add_module("experts", nn.ParameterList([nn.Parameter(torch.randn(4, 8, 16))]))
+    muon, adamw, muon_names, adamw_names = split_muon_adamw_params(model)
+    assert all(p is not conv.weight for p in muon)
+    assert sum(p is conv.weight for p in adamw) == (not frozen)
+    assert set(muon_names) == {"projection.weight", "experts.0"}
+    assert_partition(model, muon, adamw, muon_names, adamw_names)
+
+
+@pytest.mark.parametrize("module_type", [nn.Embedding, nn.Linear])
+@pytest.mark.parametrize("alias_first", [False, True])
+def test_existing_module_fallback_also_uses_parameter_identity(module_type, alias_first):
+    owner = module_type(8, 8)
+    alias = nn.Module()
+    alias.register_parameter("shared", owner.weight)
+    children = [("alias", alias), ("owner", owner)]
+    if not alias_first:
+        children.reverse()
+    model = nn.ModuleDict(children)
+    kwargs = {"no_decay_modules": ["Linear"]} if module_type is nn.Linear else {}
+    muon, adamw, muon_names, adamw_names = split_muon_adamw_params(model, **kwargs)
+    assert all(p is not owner.weight for p in muon)
+    assert sum(p is owner.weight for p in adamw) == 1
+    assert_partition(model, muon, adamw, muon_names, adamw_names)

@@ -136,7 +136,7 @@ def _is_adamw_by_name(name: str, extra_patterns: Sequence[str]) -> bool:
 
 
 def _is_muon_eligible_ndim(param: Tensor) -> bool:
-    """Return True for dense linears and 3D MoE expert stacks."""
+    """Check tensor rank before module and parameter-name exclusions."""
     return param.ndim in (2, 3)
 
 
@@ -146,20 +146,26 @@ def split_muon_adamw_params(
     no_decay_params: Optional[List[str]] = None,
     extra_adamw_name_patterns: Optional[Sequence[str]] = None,
 ) -> Tuple[List[Tensor], List[Tensor], List[str], List[str]]:
-    """Split model parameters into Muon-eligible weights and AdamW fallback weights."""
+    """Split trainable parameters into Muon and AdamW groups.
+
+    Convolution, embedding and configured no-decay modules use AdamW, including
+    tied parameters whose canonical name belongs to another module. Remaining
+    eligible 2D weights and 3D MoE stacks use Muon unless excluded by name.
+    """
     no_decay_modules = no_decay_modules or []
     no_decay_params = no_decay_params or []
     extra_patterns = list(extra_adamw_name_patterns or ())
 
-    forced_adamw_fqns: set = set()
-    for module_name, module in model.named_modules():
+    forced_adamw_param_ids: set[int] = set()
+    for module in model.modules():
         cls_name = module.__class__.__name__
         is_embedding = isinstance(module, nn.Embedding)
+        # Conv1d's 3D weight is not an [experts, out, in] matrix stack.
+        is_convolution = isinstance(module, nn.modules.conv._ConvNd)
         is_no_decay = cls_name in no_decay_modules
-        if is_embedding or is_no_decay:
-            for pname, _p in module.named_parameters(recurse=False):
-                fqn = f"{module_name}.{pname}" if module_name else pname
-                forced_adamw_fqns.add(fqn)
+        if is_embedding or is_convolution or is_no_decay:
+            # A tied parameter can have an earlier canonical name outside this module.
+            forced_adamw_param_ids.update(id(p) for p in module.parameters(recurse=False))
 
     muon_params: List[Tensor] = []
     adamw_params: List[Tensor] = []
@@ -173,7 +179,7 @@ def split_muon_adamw_params(
         muon_ok = _is_muon_eligible_ndim(param)
         forced_adamw = (
             (not muon_ok)
-            or name in forced_adamw_fqns
+            or id(param) in forced_adamw_param_ids
             or _is_adamw_by_name(name, extra_patterns)
             or any(p and p.lower() in name.lower() for p in no_decay_params)
         )

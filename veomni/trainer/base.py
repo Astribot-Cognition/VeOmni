@@ -30,6 +30,7 @@ import json
 import warnings
 from abc import ABC
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import asdict
 from typing import Any, Callable, Dict, List
 
@@ -88,7 +89,7 @@ logger = logging.get_logger(__name__)
 
 def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
     """Pull Muon-specific hyperparameters out of ``OptimizerConfig``."""
-    return {
+    kwargs = {
         "lr": optimizer_cfg.muon_lr,
         "momentum": optimizer_cfg.muon_momentum,
         "nesterov": optimizer_cfg.muon_nesterov,
@@ -98,6 +99,12 @@ def _collect_muon_kwargs(optimizer_cfg) -> Dict[str, Any]:
         "eps": optimizer_cfg.muon_eps,
         "adjust_lr_fn": optimizer_cfg.muon_adjust_lr_fn,
     }
+    if optimizer_cfg.type == "dmuon":
+        kwargs.update(
+            dmuon_ns_backend=optimizer_cfg.dmuon_ns_backend,
+            dmuon_ns_coefficients=optimizer_cfg.dmuon_ns_coefficients,
+        )
+    return kwargs
 
 
 class BaseTrainer(Stateful, ABC):
@@ -334,6 +341,7 @@ class BaseTrainer(Stateful, ABC):
             **asdict(args.data),
         )
         dataset_length = None if not hasattr(self.train_dataset, "__len__") else len(self.train_dataset)
+
         if args.data.datasets_type == "mapping":
             dataset_length = dataset_length / args.train.accelerator.dp_size
         args.compute_train_steps(dataset_length)
@@ -351,6 +359,7 @@ class BaseTrainer(Stateful, ABC):
         args: VeOmniArguments = self.args
         dataloader_kwargs = asdict(args.data.dataloader)
         dataloader_type = dataloader_kwargs.pop("type")
+
         self.train_dataloader = build_dataloader(
             dataloader_type=dataloader_type,
             dataset=self.train_dataset,
@@ -382,6 +391,8 @@ class BaseTrainer(Stateful, ABC):
             kwargs["is_peft_model"] = True
 
         muon_expert_zero_comm = args.train.optimizer.type == "muon" and args.train.optimizer.muon_expert_zero_comm
+        if args.train.optimizer.type == "dmuon":
+            kwargs["optimizer_config"] = args.train.optimizer
 
         # Parallelize model
         self.model = build_parallelize_model(
@@ -563,6 +574,14 @@ class BaseTrainer(Stateful, ABC):
         del micro_batch
         return loss, loss_dict
 
+    def gradient_sync_context(self, micro_step: int, num_micro_steps: int):
+        """Reduce dedicated and FSDP gradients on the last DMuon microbatch."""
+        if self.args.train.optimizer.type == "dmuon" and micro_step < num_micro_steps - 1:
+            import dmuon
+
+            return dmuon.no_sync(self.model)
+        return nullcontext()
+
     def model_reshard(self, micro_step: int, num_micro_steps: int):
         """Reshard model after backward pass."""
         args: VeOmniArguments = self.args
@@ -616,7 +635,8 @@ class BaseTrainer(Stateful, ABC):
             loss_dict: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
             self.micro_batch_token_len = count_loss_token(micro_batch)
-            loss, loss_dict = self.forward_backward_step(micro_batch)
+            with self.gradient_sync_context(micro_step, num_micro_steps):
+                loss, loss_dict = self.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
             for k, v in loss_dict.items():
@@ -656,6 +676,7 @@ class BaseTrainer(Stateful, ABC):
             self.on_epoch_begin()
 
             # Create a batch generator
+
             data_iterator = iter(self.train_dataloader)
 
             for _ in range(self.start_step, args.train_steps):

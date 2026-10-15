@@ -9,7 +9,11 @@ def veomni_clip_grad_norm(
 ):
     parallel_state = get_parallel_state()
     dp_mode = parallel_state.dp_mode
-    if dp_mode == "fsdp2":
+    if hasattr(model, "_veomni_dmuon_optimizer"):
+        from ..optim.dmuon import clip_dmuon_grad_norm
+
+        grad_norm = clip_dmuon_grad_norm(model, max_norm, norm_type, error_if_nonfinite)
+    elif dp_mode == "fsdp2":
         grad_norm = fsdp2_clip_grad_norm(model, max_norm, norm_type, error_if_nonfinite, foreach)
     elif dp_mode == "ddp":
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm, foreach=foreach)

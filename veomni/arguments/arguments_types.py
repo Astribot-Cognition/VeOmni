@@ -47,11 +47,11 @@ class OptimizerConfig:
     """train.optimizer.* — Optimizer and learning-rate schedule.
 
     ``type="muon"`` builds a Muon + AdamW multi-optimizer: 2D hidden weights
-    and 3D MoE expert stacks use Muon, while embeddings, lm_head, biases and
-    norms use AdamW.
+    and 3D MoE expert stacks use Muon, while embeddings, lm_head, biases,
+    norms and convolution modules use AdamW.
     """
 
-    type: Literal["adamw", "anyprecision_adamw", "muon"] = field(
+    type: Literal["adamw", "anyprecision_adamw", "muon", "dmuon"] = field(
         default="adamw",
         metadata={"help": "Optimizer type. Default to adamw."},
     )
@@ -95,13 +95,13 @@ class OptimizerConfig:
         default=1.0,
         metadata={"help": "Clip value for gradient norm."},
     )
-    # ---- Muon-specific (only consulted when type == "muon") ---------------
+    # ---- Muon/DMuon-specific --------------------------------------------
     muon_lr: float = field(
         default=2e-2,
         metadata={
             "help": (
-                "Learning rate for the Muon group (2D hidden weights and 3D expert stacks). "
-                "Per Moonlight, ~25x the AdamW lr is a common starting point."
+                "Learning rate for Muon-routed 2D weights and 3D MoE expert stacks. "
+                "AdamW fallback parameters use train.optimizer.lr."
             )
         },
     )
@@ -135,9 +135,17 @@ class OptimizerConfig:
             "help": (
                 "Per-matrix learning-rate adjustment used by Muon. "
                 "'original' follows Keller Jordan; 'match_rms_adamw' (default) "
-                "matches the RMS of an AdamW update so AdamW-tuned hyperparams transfer."
+                "uses the upstream 0.2 * sqrt(max(rows, columns)) scaling."
             )
         },
+    )
+    dmuon_ns_backend: Literal["direct", "gram"] = field(
+        default="gram",
+        metadata={"help": "Official DMuon Newton-Schulz backend."},
+    )
+    dmuon_ns_coefficients: Literal["classic", "polar_express"] = field(
+        default="polar_express",
+        metadata={"help": "Official DMuon polynomial coefficients."},
     )
     muon_expert_zero_comm: bool = field(
         default=False,
@@ -452,6 +460,10 @@ class TrainingArguments:
     num_train_epochs: int = field(
         default=1,
         metadata={"help": "Epochs to train."},
+    )
+    logging_steps: int = field(
+        default=10,
+        metadata={"help": "Print training metrics every N optimizer steps. 0 disables periodic logging."},
     )
     pad_to_length: bool = field(
         default=False,

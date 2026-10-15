@@ -371,13 +371,14 @@ model = build_parallelize_model(
 
 ### Optimizer and LR Scheduler
 
-`build_optimizer` supports three optimizer types via `train.optimizer.type`:
+`build_optimizer` supports four optimizer types via `train.optimizer.type`:
 
 | Type | Description |
 |------|-------------|
 | `adamw` (default) | Standard `torch.optim.AdamW`. |
 | `anyprecision_adamw` | Mixed-precision AdamW (Llama-recipes' AnyPrecisionAdamW). |
 | `muon` | [Muon](https://kellerjordan.github.io/posts/muon/) (PyTorch 2.9+) for 2D hidden weights and 3D MoE expert stacks (Phase 2), with AdamW for embeddings, lm_head, biases and norms. Returns a `MultiOptimizer` wrapping both. Supports single-device, FSDP2 (dense models), and FSDP2 + ExtraParallel (EP) for MoE. |
+| `dmuon` | Optional [DMuon](https://github.com/X-Square-Robot/dmuon) dedicated ownership for dense 2D matrices, with AdamW for the remaining parameters. Requires the DMuon package to be installed separately. Supports dense FSDP2/HSDP only. |
 
 Muon-specific hyperparameters live under `train.optimizer.muon_*` (e.g. `muon_lr`, `muon_momentum`, `muon_adjust_lr_fn`); `lr` / `weight_decay` / `betas` / `eps` continue to drive the AdamW sibling group.
 
@@ -405,6 +406,24 @@ For MoE training under FSDP2+EP, the Muon flow auto-classifies each parameter in
 | 3D `DTensor` with `Shard(d>0)` (default backend) | `moe_gather_3d` | one all-to-all-gather over the `ep_fsdp` mesh |
 
 See `configs/text/qwen3_moe_muon.yaml` for an end-to-end Qwen3-MoE-30B-A3B sample.
+
+### DMuon
+
+DMuon is an optional integration with the external `dmuon` package; selecting
+`type: dmuon` without that package installed raises an import error. The package
+version and installation command are integration-specific and are not added to
+VeOmni's default dependencies. DMuon currently requires dense CUDA FSDP2/HSDP
+without tensor, sequence or expert parallelism, CPU offload or LoRA. Its DCP
+checkpoints use synchronous saving and a DMuon-specific optimizer sidecar; do
+not resume optimizer state across DMuon and another optimizer type. Loading
+model weights without optimizer state is supported when changing optimizer.
+
+The backend can be selected with `train.optimizer.dmuon_ns_backend` (`direct`
+or `gram`) and `train.optimizer.dmuon_ns_coefficients` (`classic` or
+`polar_express`). The default is `gram` with `polar_express`. DMuon requires
+`muon_adjust_lr_fn: match_rms_adamw`; the dedicated matrix group uses the
+configured `muon_lr`, while AdamW fallback parameters use `lr` and preserve
+semantic parameter-group learning-rate ratios.
 
 ```python
 from veomni.optim import build_lr_scheduler, build_optimizer

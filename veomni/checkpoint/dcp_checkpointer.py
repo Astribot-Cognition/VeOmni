@@ -14,14 +14,16 @@
 
 
 import gc
+import math
 import os
 from collections import OrderedDict
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any, Dict, Optional, Union
 
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed._tensor import DeviceMesh, DTensor, Shard
+from torch.distributed._tensor import DeviceMesh, DTensor, Shard, distribute_tensor
 from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
@@ -38,6 +40,8 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.checkpoint.stateful import Stateful
 
 from ..distributed.parallel_state import get_parallel_state
+from ..optim.muon import DistributedMuon
+from ..optim.optimizer import AnyPrecisionAdamW
 from ..utils import logging
 from ..utils.checkpoint_utils import _GLOBAL_STEP_PREFIX
 from ..utils.device import empty_cache, synchronize
@@ -48,6 +52,97 @@ logger = logging.get_logger(__name__)
 
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 _EXTRA_STATE_DIR = "extra_state"
+_DMUON_OPTIMIZER_STATE = "dmuon_optimizer.pt"
+
+
+def _dmuon_parameter_info(model):
+    import dmuon
+
+    parameters = dict(model.named_parameters())
+    module_names = {id(module): name for name, module in model.named_modules()}
+    dedicated_names = {}
+    shapes = {name: tuple(param.shape) for name, param in parameters.items()}
+    for param in dmuon.get_dedicated_params(model):
+        prefix = module_names[id(param.module)]
+        name = f"{prefix}.{param.param_name}" if prefix else param.param_name
+        dedicated_names[param] = name
+        shapes[name] = tuple(param._orig_size)
+    return parameters, dedicated_names, shapes
+
+
+def _dmuon_local_tensor(full_tensor, param):
+    """Use DTensor placements for uneven and empty ordinary FSDP shards."""
+    return (
+        distribute_tensor(
+            full_tensor.to(device=param.device, dtype=param.dtype),
+            device_mesh=param.device_mesh,
+            placements=param.placements,
+            # DCP has already loaded the full tensor on every rank.
+            src_data_rank=None,
+        )
+        .to_local()
+        .clone(memory_format=torch.contiguous_format)
+    )
+
+
+def _dmuon_optimizer_layout(model, optimizer):
+    parameters, dedicated_names, shapes = _dmuon_parameter_info(model)
+    group_names = [[] for _ in optimizer.param_groups]
+    sections = {"fsdp": set(), "dedicated": set(), "dedicated_adamw": set()}
+    for param, name in dedicated_names.items():
+        for mapping, section in (
+            (optimizer._dp_to_muon_group_idx, "dedicated"),
+            (optimizer._dp_to_adamw_group_idx, "dedicated_adamw"),
+        ):
+            if id(param) in mapping:
+                group_names[mapping[id(param)]].append(name)
+                sections[section].add(name)
+    for name, param in parameters.items():
+        if id(param) in optimizer._adamw_param_to_group_idx:
+            group_names[optimizer._adamw_param_to_group_idx[id(param)]].append(name)
+            sections["fsdp"].add(name)
+    return [sorted(names) for names in group_names], sections, shapes
+
+
+def _validate_dmuon_optimizer_state(model, optimizer, state):
+    """Reject silent upstream partial restores and normalize scalar AdamW steps."""
+    expected_keys = {"fsdp", "dedicated", "dedicated_adamw", "param_groups", "_veomni_param_groups"}
+    if state.keys() != expected_keys:
+        raise ValueError(f"Invalid DMuon optimizer checkpoint sections: {sorted(state.keys())}")
+    group_names, sections, shapes = _dmuon_optimizer_layout(model, optimizer)
+    if state["_veomni_param_groups"] != group_names:
+        raise ValueError("DMuon optimizer parameter group membership differs from the checkpoint")
+    if len(state["param_groups"]) != len(optimizer.param_groups):
+        raise ValueError("DMuon optimizer parameter group count differs from the checkpoint")
+    for index, (saved, current) in enumerate(zip(state["param_groups"], optimizer.param_groups)):
+        for key in ("use_muon", "subgroup_type", "group_name", "semantic_group_name"):
+            if saved.get(key) != current.get(key):
+                raise ValueError(f"DMuon optimizer parameter group {index} differs for {key}")
+    for section, allowed_names in sections.items():
+        entries = state[section]
+        if not isinstance(entries, dict) or set(entries) - allowed_names:
+            raise ValueError(f"Invalid parameter names in DMuon optimizer {section} state")
+        if section != "fsdp" and entries and set(entries) != allowed_names:
+            raise ValueError(f"Incomplete DMuon optimizer {section} state")
+        expected_state_keys = {"momentum_buffer"} if section == "dedicated" else {"step", "exp_avg", "exp_avg_sq"}
+        for name, entry in entries.items():
+            if not isinstance(entry, dict) or entry.keys() != expected_state_keys:
+                raise ValueError(f"Invalid DMuon optimizer state keys for {name}")
+            for key, tensor in entry.items():
+                if key == "step":
+                    # The upstream setter treats every Tensor as a parameter-shaped shard.
+                    value = tensor.item() if isinstance(tensor, torch.Tensor) and tensor.numel() == 1 else tensor
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(value)
+                        or value < 0
+                        or int(value) != value
+                    ):
+                        raise ValueError(f"Invalid DMuon optimizer step for {name}")
+                    entry[key] = int(value)
+                elif not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != shapes[name]:
+                    raise ValueError(f"Invalid DMuon optimizer {key} shape for {name}; expected {shapes[name]}")
 
 
 class ModelState(Stateful):
@@ -76,6 +171,22 @@ class ModelState(Stateful):
 
     @torch.no_grad()
     def state_dict(self):
+        if getattr(self.model, "_dedicated_comm_ctx", None) is not None:
+            import dmuon
+
+            # DCP needs full tensors on every rank to describe dedicated parameters.
+            model_state_dict = dmuon.get_model_state_dict(self.model, cpu_offload=True, rank0_only=False)
+            if self.trainable_only:
+                trainable_names = {name for name, param in self.model.named_parameters() if param.requires_grad}
+                model_state_dict = {
+                    name: tensor for name, tensor in model_state_dict.items() if name in trainable_names
+                }
+            # The upstream DMuon helper enumerates parameters, omitting persistent buffers.
+            for name, buffer in self._persistent_buffers():
+                full_buffer = buffer.full_tensor() if isinstance(buffer, DTensor) else buffer
+                model_state_dict[name] = full_buffer.detach().cpu().clone()
+            return model_state_dict
+
         options = StateDictOptions(ignore_frozen_params=True) if self.trainable_only else None
         model_state_dict = get_model_state_dict(model=self.model, options=options)
         if self.should_extra_parallel_aware:
@@ -95,12 +206,78 @@ class ModelState(Stateful):
         need to drop ExtraParallel-dim when loading from DCP checkpoints
         so that ExtraParallel-FSDP would not be confused
         """
+        if getattr(self.model, "_dedicated_comm_ctx", None) is not None:
+            import dmuon
+
+            buffers = dict(self._persistent_buffers())
+            expected_names, shapes = self._dmuon_model_spec()
+            missing = expected_names - state_dict.keys()
+            unexpected = state_dict.keys() - shapes.keys()
+            if missing or unexpected:
+                raise RuntimeError(
+                    f"DMuon model state has missing keys {sorted(missing)} and unexpected keys {sorted(unexpected)}"
+                )
+            for name, tensor in state_dict.items():
+                if not isinstance(tensor, torch.Tensor) or tuple(tensor.shape) != shapes[name]:
+                    raise RuntimeError(f"DMuon model state has invalid shape for {name}; expected {shapes[name]}")
+            parameters, dedicated_names, _ = _dmuon_parameter_info(self.model)
+            dedicated_fqns = set(dedicated_names.values())
+            fsdp_params = {
+                name: param
+                for name, param in parameters.items()
+                if isinstance(param, DTensor) and name not in dedicated_fqns
+            }
+            # Upstream assumes equally sized local FSDP shards on load.
+            dmuon.set_model_state_dict(
+                self.model, {name: tensor for name, tensor in state_dict.items() if name not in fsdp_params}
+            )
+            for name, param in fsdp_params.items():
+                if name in state_dict:
+                    param.to_local().copy_(_dmuon_local_tensor(state_dict[name], param))
+            for name, buffer in buffers.items():
+                if name not in state_dict:
+                    continue
+                full_buffer = state_dict[name].to(device=buffer.device, dtype=buffer.dtype)
+                if isinstance(buffer, DTensor):
+                    full_buffer = distribute_tensor(
+                        full_buffer, device_mesh=buffer.device_mesh, placements=buffer.placements
+                    )
+                buffer.copy_(full_buffer)
+            return
+
         model_state_dict = state_dict
         if self.should_extra_parallel_aware:
             model_state_dict = self.get_state_dict_with_extra_parallel_dim_preprocess(model_state_dict, "drop")
 
         options = StateDictOptions(strict=False) if self.trainable_only else None
         set_model_state_dict(model=self.model, model_state_dict=model_state_dict, options=options)
+
+    def _persistent_buffers(self):
+        for module_name, module in self.model.named_modules():
+            for name, buffer in module._buffers.items():
+                if buffer is not None and name not in module._non_persistent_buffers_set:
+                    yield f"{module_name}.{name}" if module_name else name, buffer
+
+    def _dmuon_model_spec(self):
+        parameters, _, shapes = _dmuon_parameter_info(self.model)
+        buffers = dict(self._persistent_buffers())
+        shapes.update({name: tuple(buffer.shape) for name, buffer in buffers.items()})
+        expected = {
+            name for name, param in parameters.items() if not self.trainable_only or param.requires_grad
+        } | buffers.keys()
+        return expected, shapes
+
+    def validate_dmuon_metadata(self, metadata):
+        """Check original DCP shapes before its planner can truncate checkpoint tensors."""
+        if getattr(self.model, "_dedicated_comm_ctx", None) is None:
+            return
+        expected, shapes = self._dmuon_model_spec()
+        saved = {name[6:]: info for name, info in metadata.state_dict_metadata.items() if name.startswith("model.")}
+        if expected - saved.keys() or saved.keys() - shapes.keys():
+            raise ValueError("DMuon checkpoint model parameter or buffer names differ from the current model")
+        for name, info in saved.items():
+            if not hasattr(info, "size") or tuple(info.size) != shapes[name]:
+                raise ValueError(f"DMuon checkpoint model tensor shape differs for {name}; expected {shapes[name]}")
 
     def get_state_dict_with_extra_parallel_dim_preprocess(self, state_dict, action):
         extra_parallel_fqn2spec_info = self.extra_parallel_fqn2spec_info
@@ -179,36 +356,90 @@ class OptimizerState(Stateful):
         )
 
     def state_dict(self):
-        if self.should_extra_parallel_aware:
-            logger.info_rank0(
-                "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
-            )
-            # MultiOptimizer is only used for ExtraParallel+FSDP2 case for now,
-            # and it knows how to produce a merged, flattened dict already
-            assert self.optimizer._is_multi_optimizer, (
-                "ExtraParallel is enabled but optimizer is not a MultiOptimizer instance"
-            )
-            vanilla_optim_sd = self.optimizer.state_dict()
-            optim_sd_with_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
-                vanilla_optim_sd, "restore"
-            )
-            return optim_sd_with_extra_parallel_dim
+        if getattr(self.optimizer, "_is_multi_optimizer", False):
+            # MultiOptimizer owns the flattened FQN schema for its children.
+            with ExitStack() as stack:
+                if self.fill_missing_optimizer_states:
+                    for name in self.optimizer.key_names:
+                        stack.enter_context(self._seed_empty_optimizer_state(self.optimizer.optimizers_dict[name]))
+                sd = self.optimizer.state_dict()
+                if self.fill_missing_optimizer_states:
+                    for name in self.optimizer.key_names:
+                        optimizer = self.optimizer.optimizers_dict[name]
+                        child_sd = get_optimizer_state_dict(model=self.model, optimizers=optimizer)
+                        child_sd = self._fill_missing_optimizer_states(child_sd, optimizer)
+                        for fqn, state in child_sd["state"].items():
+                            for key, value in state.items():
+                                sd[f"state.{fqn}.{key}"] = value
+            if self.should_extra_parallel_aware:
+                logger.info_rank0(
+                    "Getting optimizer state_dict from OptimizerState wrapper, would restore ExtraParallel dim for Experts module"
+                )
+                sd = self.get_state_dict_with_extra_parallel_dim_preprocess(sd, "restore")
+            return sd
 
-        # Single torch optimizer
-        sd = get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
-        if self.fill_missing_optimizer_states:
-            sd = self._fill_missing_optimizer_states(sd)
+        if self.should_extra_parallel_aware:
+            raise AssertionError("ExtraParallel is enabled but optimizer is not a MultiOptimizer instance")
+
+        with self._seed_empty_optimizer_state(self.optimizer) if self.fill_missing_optimizer_states else nullcontext():
+            sd = get_optimizer_state_dict(model=self.model, optimizers=self.optimizer)
+            if self.fill_missing_optimizer_states:
+                sd = self._fill_missing_optimizer_states(sd, self.optimizer)
         return sd
 
-    def _fill_missing_optimizer_states(self, sd):
+    @staticmethod
+    @contextmanager
+    def _seed_empty_optimizer_state(optimizer):
+        """Avoid PyTorch's zero-LR dummy step when no parameter has state yet."""
+        if any(optimizer.state.values()):
+            yield
+            return
+
+        group = next((group for group in optimizer.param_groups if group["params"]), None)
+        if group is None:
+            yield
+            return
+        param = group["params"][0]
+        if isinstance(optimizer, DistributedMuon):
+            placeholder = {"momentum_buffer": torch.zeros_like(param)}
+        elif isinstance(optimizer, torch.optim.AdamW):
+            step_device = param.device if group.get("capturable") or group.get("fused") else "cpu"
+            placeholder = {
+                "step": torch.zeros((), dtype=torch.float32, device=step_device),
+                "exp_avg": torch.zeros_like(param),
+                "exp_avg_sq": torch.zeros_like(param),
+            }
+            if group.get("amsgrad"):
+                placeholder["max_exp_avg_sq"] = torch.zeros_like(param)
+        elif isinstance(optimizer, AnyPrecisionAdamW):
+            placeholder = {
+                "step": torch.zeros(()),
+                "exp_avg": torch.zeros_like(param, dtype=group["momentum_dtype"]),
+                "exp_avg_sq": torch.zeros_like(param, dtype=group["variance_dtype"]),
+            }
+            if group["use_kahan_summation"]:
+                placeholder["compensation"] = torch.zeros_like(param, dtype=group["compensation_buffer_dtype"])
+        else:
+            yield
+            return
+
+        original = optimizer.state.get(param)
+        optimizer.state[param] = placeholder
+        try:
+            yield
+        finally:
+            if original is None:
+                del optimizer.state[param]
+            else:
+                optimizer.state[param] = original
+
+    def _fill_missing_optimizer_states(self, sd, optimizer):
         """Ensure every optimizer param has state entries in the state dict.
 
         Adam/AdamW creates state lazily on first ``step()`` with a non-None
-        gradient.  Params that never received a gradient (e.g. LoRA on unused
-        modalities) will have no state.  Additionally, ``get_optimizer_state_dict``
-        deduplicates aliased parameters (same ``id()``), emitting only one
-        canonical FQN per unique tensor.  DCP strict load fails when these
-        entries are absent at resume time.
+        gradient. Params that never received a gradient (e.g. LoRA on unused
+        modalities) will have no state. Each child optimizer supplies its own
+        template, so heterogeneous Muon and AdamW states stay separate.
 
         We enumerate expected FQNs directly from the raw optimizer param_groups
         + model FQN mapping, bypassing any dedup that ``get_optimizer_state_dict``
@@ -222,7 +453,7 @@ class OptimizerState(Stateful):
         # Build expected FQNs from raw optimizer param_groups, not from the
         # already-deduped sd["param_groups"].
         optim_param_ids = set()
-        for group in self.optimizer.param_groups:
+        for group in optimizer.param_groups:
             for p in group["params"]:
                 optim_param_ids.add(id(p))
 
@@ -275,8 +506,11 @@ class OptimizerState(Stateful):
             optim_state_without_extra_parallel_dim = self.get_state_dict_with_extra_parallel_dim_preprocess(
                 optim_state_from_dcp_load, "drop"
             )
-            # Delegate to MultiOptimizer (it will split/filter correctly)
-            self.optimizer.load_state_dict(optim_state_without_extra_parallel_dim)
+            optim_state_from_dcp_load = optim_state_without_extra_parallel_dim
+
+        if getattr(self.optimizer, "_is_multi_optimizer", False):
+            # Delegate the flattened FQN schema to each child optimizer.
+            self.optimizer.load_state_dict(optim_state_from_dcp_load)
             return
 
         # Single torch optimizer
@@ -446,14 +680,26 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to save a distributed checkpoint.")
 
+        dmuon_model = getattr(state["model"], "_dedicated_comm_ctx", None) is not None
+        dmuon_optimizer = getattr(state.get("optimizer"), "_veomni_dmuon", False)
+        if save_async and (dmuon_model or dmuon_optimizer):
+            raise ValueError("DMuon checkpoints currently support synchronous saving only.")
+        if "optimizer" in state and dmuon_model != dmuon_optimizer:
+            raise ValueError("A dedicated DMuon model must be saved with its DMuon optimizer.")
+
         checkpoint_dir = f"{path}/{_GLOBAL_STEP_PREFIX}{global_steps}" if global_steps else path
+        optimizer_state_path = os.path.join(checkpoint_dir, _DMUON_OPTIMIZER_STATE)
+        if os.path.exists(optimizer_state_path) or (
+            dmuon_model and os.path.exists(os.path.join(checkpoint_dir, ".metadata"))
+        ):
+            raise ValueError("Refusing to overwrite an existing checkpoint with a DMuon format; use a new directory.")
         cls._create_checkpoint_dir(checkpoint_dir)
 
         # saving extra_state first to gurantee that every saved model/optimizer ckpts have their extra_state saved before them
         cls._save_extra_state(checkpoint_dir=checkpoint_dir, state=state)
 
         save_state = {"model": ModelState(state["model"], trainable_only=trainable_only)}
-        if "optimizer" in state:
+        if "optimizer" in state and not dmuon_optimizer:
             save_state["optimizer"] = OptimizerState(
                 model=state["model"], optimizer=state["optimizer"], fill_missing_optimizer_states=True
             )  # type: ignore[index]
@@ -462,6 +708,20 @@ class DistributedCheckpointer(CheckpointerBase):
             storage_writer = cls._create_storage_writer(checkpoint_dir)
 
         cls.execute_save(save_state=save_state, storage_writer=storage_writer, save_async=save_async)
+
+        if dmuon_optimizer:
+            import dmuon
+
+            # Every rank participates; only rank 0 retains and writes the full optimizer state.
+            optimizer_state = dmuon.get_optimizer_state_dict(
+                state["model"], state["optimizer"], cpu_offload=True, rank0_only=True
+            )
+            if dist.get_rank() == 0:
+                optimizer_state["_veomni_param_groups"] = _dmuon_optimizer_layout(state["model"], state["optimizer"])[
+                    0
+                ]
+                torch.save(optimizer_state, optimizer_state_path)
+            dist.barrier()
 
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
@@ -498,19 +758,60 @@ class DistributedCheckpointer(CheckpointerBase):
         if "model" not in state:
             raise ValueError("Model must be provided to load a distributed checkpoint.")
 
+        dmuon_optimizer = getattr(state.get("optimizer"), "_veomni_dmuon", False)
+        dmuon_model = getattr(state["model"], "_dedicated_comm_ctx", None) is not None
+        if "optimizer" in state and dmuon_model != dmuon_optimizer:
+            raise ValueError("A dedicated DMuon model must be loaded with its DMuon optimizer.")
+        optimizer_state_path = os.path.join(checkpoint_dir, _DMUON_OPTIMIZER_STATE)
+        if "optimizer" in state and dmuon_optimizer != os.path.isfile(optimizer_state_path):
+            raise ValueError(
+                "DMuon optimizer state cannot be resumed with an AdamW/Muon optimizer, or vice versa. "
+                "Load model weights only to switch optimizer types."
+            )
+        if dmuon_optimizer:
+            optimizer_state = torch.load(optimizer_state_path, map_location="cpu", weights_only=False)
+            _validate_dmuon_optimizer_state(state["model"], state["optimizer"], optimizer_state)
+
         load_state = {"model": ModelState(state["model"], trainable_only=trainable_only)}
-        if "optimizer" in state:
+        if "optimizer" in state and not dmuon_optimizer:
             load_state["optimizer"] = OptimizerState(model=state["model"], optimizer=state["optimizer"])  # type: ignore[index]
 
         if storage_reader is None:
             storage_reader = cls._create_storage_reader(checkpoint_dir)
 
+        if dmuon_model:
+            load_state["model"].validate_dmuon_metadata(storage_reader.read_metadata())
         dcp.load(
             state_dict=load_state,
             storage_reader=storage_reader,
             process_group=process_group,
         )
         # Note: further per-param DTensor alignment and device fixes happen inside OptimizerState.load_state_dict
+
+        if dmuon_optimizer:
+            import dmuon
+
+            optimizer = state["optimizer"]
+            optimizer.state.clear()
+            parameters = dict(state["model"].named_parameters())
+            fsdp_params = {
+                name: parameters[name] for name in optimizer_state["fsdp"] if isinstance(parameters[name], DTensor)
+            }
+            dmuon.set_optimizer_state_dict(
+                state["model"],
+                optimizer,
+                {
+                    **optimizer_state,
+                    "fsdp": {
+                        name: entry for name, entry in optimizer_state["fsdp"].items() if name not in fsdp_params
+                    },
+                },
+            )
+            for name, param in fsdp_params.items():
+                optimizer.state[param] = {
+                    key: _dmuon_local_tensor(value, param) if isinstance(value, torch.Tensor) else value
+                    for key, value in optimizer_state["fsdp"][name].items()
+                }
 
         cls._load_extra_state(checkpoint_dir=checkpoint_dir, state=state)
 

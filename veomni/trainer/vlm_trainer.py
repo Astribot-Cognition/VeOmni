@@ -297,7 +297,8 @@ class VLMTrainer:
             loss_dict: Dict[str, torch.Tensor]
             # token num for fixed_ce_loss in postforward
             self.base.micro_batch_token_len = count_loss_token(micro_batch)
-            loss, loss_dict = self.base.forward_backward_step(micro_batch)
+            with self.base.gradient_sync_context(micro_step, num_micro_steps):
+                loss, loss_dict = self.base.forward_backward_step(micro_batch)
 
             total_loss += loss.item()
             for k, v in loss_dict.items():

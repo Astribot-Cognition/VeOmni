@@ -247,6 +247,9 @@ class TqdmCallback(Callback):
         self.data_loader_tqdm.close()
 
     def on_step_end(self, state: TrainerState, **kwargs) -> None:
+        args: "VeOmniArguments" = self.trainer.args
         postfix = ", ".join(f"{k.split('/', 1)[-1]}: {v:.2f}" for k, v in self.trainer.step_train_metrics.items())
         self.data_loader_tqdm.set_postfix_str(postfix)
         self.data_loader_tqdm.update()
+        if args.train.logging_steps > 0 and state.global_step % args.train.logging_steps == 0:
+            logger.info_rank0(f"Step {state.global_step}: {postfix}")

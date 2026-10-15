@@ -123,6 +123,21 @@ def parallelize_model_fsdp2(
     ]
     logger.info_rank0(f"target classes to shard: {target_classes}")
 
+    optimizer_config = kwargs.pop("optimizer_config", None)
+    if optimizer_config is not None:
+        from ..optim.dmuon import dedicate_model
+
+        if kwargs.get("enable_fsdp_offload") or kwargs.get("is_peft_model"):
+            raise ValueError("DMuon CPU offload and LoRA are not supported")
+        if weights_path is None:
+            model.to_empty(device="cpu")
+            _reset_hf_initialized_flag(model)
+            model.init_weights()
+        else:
+            # The converter also initializes MoT experts and extended vocabulary.
+            load_model_weights(model, weights_path, init_device="cpu")
+        dedicate_model(model, optimizer_config, mixed_precision, target_classes, enable_reshard_after_forward)
+
     # Step 1: Apply ExtraParallel
     #   e.g. Apply expert parallelism (slice expert tensors [128,H,I] -> [16,H,I])
     #        Apply embed parallelism (slice embed tensors [64,H] -> [16,H])
@@ -359,7 +374,9 @@ def parallelize_model_fsdp2(
     assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
     materialize_device = "cpu" if enable_fsdp_cpu_offload else get_device_type()
 
-    if weights_path is None:
+    if optimizer_config is not None:
+        pass  # Weights were loaded before dedicated parameter ownership.
+    elif weights_path is None:
         model.to_empty(device=materialize_device)
         _reset_hf_initialized_flag(model)
         model.init_weights()
@@ -399,8 +416,11 @@ def parallelize_model_fsdp2(
                 adapter_path=adapter_path,
             )
 
-    # Register grad norm clipping method for FSDP2
-    from .fsdp2 import clip_grad_norm as clip_grad_norm_fn
+    # Dedicated gradients must share the FSDP gradients' clipping coefficient.
+    if optimizer_config is not None:
+        from ..optim.dmuon import clip_dmuon_grad_norm as clip_grad_norm_fn
+    else:
+        from .fsdp2 import clip_grad_norm as clip_grad_norm_fn
 
     model.clip_grad_norm_ = types.MethodType(clip_grad_norm_fn, model)
 
@@ -426,11 +446,20 @@ def build_parallelize_model(
 
     parallel_state = get_parallel_state()
 
+    if kwargs.get("optimizer_config") is not None and (
+        parallel_state.dp_mode != "fsdp2"
+        or parallel_state.tp_enabled
+        or parallel_state.sp_enabled
+        or parallel_state.any_extra_parallel_enabled
+    ):
+        raise ValueError("DMuon requires dense FSDP2/HSDP without TP/SP/EP")
+
     if not parallel_state.fsdp_enabled:
         if kwargs.get("init_device") not in ["cuda", "npu"]:
             raise ValueError("Only FSDP training supports `init_device=meta`.")
 
-    if mixed_precision.enable:  # upcast to float32 before feed it to optimizer
+    if mixed_precision.enable or kwargs.get("optimizer_config") is not None:
+        # DMuon exports masters in the original parameter dtype for checkpoints.
         model = model.float()
 
     if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):

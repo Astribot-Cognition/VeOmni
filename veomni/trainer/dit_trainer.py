@@ -505,7 +505,8 @@ class DiTTrainer:
             loss: torch.Tensor
             loss_dict: Dict[str, torch.Tensor]
 
-            loss, loss_dict = self.forward_backward_step(micro_batch)
+            with self.base.gradient_sync_context(micro_step, num_micro_batches):
+                loss, loss_dict = self.forward_backward_step(micro_batch)
 
             if self.training_task != "offline_embedding":
                 total_loss += loss.item()
